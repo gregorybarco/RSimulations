@@ -1,0 +1,308 @@
+# VIX Monte Carlo Simulator
+# Simulates between the Market Open and Market Close data
+# Constrained Stochastic Path Generator with Brownian Bridge
+# Author: Gregory Barco
+# Purpose: Generate realistic VIX paths satisfying end-of-day boundary constraints
+
+library(ggplot2)
+library(dplyr)
+
+# =============================================================================
+# TRADING SESSION PARAMETERS - UPDATE THESE FOR EACH SIMULATION
+# =============================================================================
+
+# VIX Market Data (Input your actual trading day values here)
+F_START <- 16.94      # VIX Open Price
+F_END <- 18.02        # VIX Close Price  
+F_MAX <- 18.86        # VIX Daily High
+F_MIN <- 16.25        # VIX Daily Low
+
+# Session Configuration
+TIME_FINAL <- 13      # Trading session duration (hours) - 2:15 AM to 3:15 PM
+N_STEPS <- 1000       # Path resolution (higher = smoother paths)
+
+# Monte Carlo Configuration
+MC_VOLATILITY <- "AUTO"        # "AUTO" for calculated volatility, or manual value (e.g., 1.2)
+MC_N_PATHS <- 10              # Number of simulation paths
+MC_SEED <- as.integer(1000000 * runif(1)) # Random seed for reproducibility
+
+# Volatility Calculation Settings (used when MC_VOLATILITY = "AUTO")
+VOLATILITY_STYLE <- "MODERATE" # "CONSERVATIVE" (0.5x), "MODERATE" (1.0x), "AGGRESSIVE" (1.5x)
+
+# Visualization Settings
+AUTO_SCALE <- TRUE            # TRUE for dynamic Y-axis, FALSE for manual limits
+MANUAL_Y_MIN <- 1             # Manual Y minimum (if AUTO_SCALE = FALSE)
+MANUAL_Y_MAX <- 100           # Manual Y maximum (if AUTO_SCALE = FALSE)
+Y_PADDING <- 0.15             # Extra space around data (15%)
+
+# =============================================================================
+# QUANTITATIVE FUNCTIONS
+# =============================================================================
+
+# Volatility Auto-Calculation Using Time-Scaled Range Method
+calculate_volatility <- function(f_start, f_max, f_min, trading_hours, style) {
+  
+  # Time scaling factor for Brownian motion (sqrt scaling law)
+  standard_day <- 24
+  time_scaling <- sqrt(trading_hours / standard_day)
+  
+  # Range-based volatility estimation
+  daily_range <- f_max - f_min
+  volatility_ratio <- daily_range / f_start
+  base_volatility <- volatility_ratio * time_scaling
+  
+  # Style risk multipliers
+  multipliers <- list(
+    "CONSERVATIVE" = 0.5,
+    "MODERATE" = 1.0, 
+    "AGGRESSIVE" = 1.5
+  )
+  
+  final_volatility <- base_volatility * multipliers[[style]]
+  
+  # Output calculation details
+  cat("\n=== VOLATILITY CALCULATION ===\n")
+  cat(sprintf("Trading Hours: %g | Time Scaling: √(%g/24) = %.4f\n", 
+              trading_hours, trading_hours, time_scaling))
+  cat(sprintf("VIX Range: %.2f | Starting Value: %.2f | Ratio: %.4f\n", 
+              daily_range, f_start, volatility_ratio))
+  cat(sprintf("Base Volatility: %.4f | Style: %s | Final: %.4f\n", 
+              base_volatility, style, final_volatility))
+  cat("==============================\n\n")
+  
+  return(final_volatility)
+}
+
+# Monte Carlo Path Generator with Brownian Bridge
+generate_constrained_paths <- function(n_paths, n_steps, f_0, f_T, f_max, f_min, T_final, volatility) {
+  
+  # Validate boundary constraints
+  if (f_0 > f_max || f_0 < f_min || f_T > f_max || f_T < f_min) {
+    stop("ERROR: Start/End values must be within [f_min, f_max] bounds")
+  }
+  
+  # Initialize storage
+  all_paths <- data.frame()
+  path_stats <- data.frame()
+  
+  cat(sprintf("Generating %d constrained paths...\n", n_paths))
+  
+  # Generate each Monte Carlo path
+  for (i in 1:n_paths) {
+    
+    # Time discretization
+    dt <- T_final / n_steps
+    t <- seq(0, T_final, by = dt)
+    
+    # Brownian motion increments
+    dW <- rnorm(n_steps, mean = 0, sd = sqrt(dt))
+    
+    # Deterministic trend component (ensures f(0) -> f(T))
+    linear_trend <- f_0 + (f_T - f_0) * t / T_final
+    
+    # Stochastic component using Brownian bridge construction
+    stochastic_component <- numeric(length(t))
+    stochastic_component[1] <- 0  # Bridge starts at 0
+    
+    for (j in 2:length(t)) {
+      remaining_time <- T_final - t[j]
+      if (remaining_time > 0) {
+        # Brownian bridge formula with mean reversion
+        stochastic_component[j] <- stochastic_component[j-1] + 
+          volatility * dW[j-1] - 
+          (stochastic_component[j-1] * dt / remaining_time)
+      } else {
+        stochastic_component[j] <- 0  # Bridge ends at 0
+      }
+    }
+    
+    # Combine deterministic trend + stochastic fluctuations
+    raw_path <- linear_trend + stochastic_component
+    
+    # Apply hard constraints via reflection method
+    constrained_path <- pmax(f_min, pmin(f_max, raw_path))
+    
+    # Enforce exact boundary conditions
+    constrained_path[1] <- f_0
+    constrained_path[length(constrained_path)] <- f_T
+    
+    # Store path data
+    path_data <- data.frame(
+      time = t,
+      value = constrained_path,
+      path_id = i
+    )
+    all_paths <- rbind(all_paths, path_data)
+    
+    # Calculate path statistics
+    path_summary <- data.frame(
+      path_id = i,
+      start_value = f_0,
+      end_value = f_T,
+      path_max = max(constrained_path),
+      path_min = min(constrained_path),
+      total_variation = sum(abs(diff(constrained_path)))
+    )
+    path_stats <- rbind(path_stats, path_summary)
+  }
+  
+  return(list(paths = all_paths, statistics = path_stats))
+}
+
+# Dynamic Y-Axis Calculator
+calculate_plot_limits <- function(path_data, constraints, padding_pct) {
+  all_values <- c(path_data$value, constraints$f_min, constraints$f_max, 
+                  constraints$f_start, constraints$f_end)
+  
+  data_min <- min(all_values)
+  data_max <- max(all_values)
+  data_range <- data_max - data_min
+  padding <- data_range * padding_pct
+  
+  y_min <- max(0, data_min - padding)  # VIX can't go negative
+  y_max <- data_max + padding
+  
+  return(list(y_min = y_min, y_max = y_max))
+}
+
+# =============================================================================
+# SIMULATION EXECUTION
+# =============================================================================
+
+# Set reproducible random seed
+set.seed(MC_SEED)
+
+# Determine volatility parameter
+if (MC_VOLATILITY == "AUTO") {
+  actual_volatility <- calculate_volatility(F_START, F_MAX, F_MIN, TIME_FINAL, VOLATILITY_STYLE)
+} else {
+  actual_volatility <- as.numeric(MC_VOLATILITY)
+  cat(sprintf("Using Manual Volatility: %.4f\n\n", actual_volatility))
+}
+
+# Execute Monte Carlo simulation
+simulation_results <- generate_constrained_paths(
+  n_paths = MC_N_PATHS,
+  n_steps = N_STEPS,
+  f_0 = F_START,
+  f_T = F_END,
+  f_max = F_MAX,
+  f_min = F_MIN,
+  T_final = TIME_FINAL,
+  volatility = actual_volatility
+)
+
+# Calculate ensemble average path
+ensemble_average <- simulation_results$paths %>%
+  group_by(time) %>%
+  summarise(avg_value = mean(value, na.rm = TRUE), .groups = 'drop')
+
+# Determine plot limits
+constraints <- list(f_start = F_START, f_end = F_END, f_max = F_MAX, f_min = F_MIN)
+
+if (AUTO_SCALE) {
+  limits <- calculate_plot_limits(simulation_results$paths, constraints, Y_PADDING)
+  y_min <- limits$y_min
+  y_max <- limits$y_max
+  cat(sprintf("Auto Y-Axis Range: [%.2f, %.2f]\n", y_min, y_max))
+} else {
+  y_min <- MANUAL_Y_MIN
+  y_max <- MANUAL_Y_MAX
+  cat(sprintf("Manual Y-Axis Range: [%.2f, %.2f]\n", y_min, y_max))
+}
+
+# =============================================================================
+# PROFESSIONAL VISUALIZATION
+# =============================================================================
+
+# Plot 1: Ensemble Average Path
+plot_average <- ggplot(ensemble_average, aes(x = time, y = avg_value)) +
+  geom_line(color = "#E31A1C", size = 1, alpha = 1) +
+  geom_hline(yintercept = F_MAX, linetype = "dashed", color = "#2C3E50", size = 0.8) +
+  geom_hline(yintercept = F_MIN, linetype = "dashed", color = "#2C3E50", size = 0.8) +
+  geom_point(aes(x = 0, y = F_START), color = "#27AE60", size = 10, alpha = 1) +
+  geom_point(aes(x = TIME_FINAL, y = F_END), color = "#F39C12", size = 10, alpha = 1) +
+  ylim(y_min, y_max) +
+  labs(
+    title = sprintf("VIX Monte Carlo Ensemble Average (%d Paths)", MC_N_PATHS),
+    subtitle = sprintf("Open: %.2f | Close: %.2f | Volatility: %.3f", 
+                       F_START, F_END, actual_volatility),
+    x = "Trading Hours",
+    y = "VIX Level"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "#7F8C8D"),
+    axis.title = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+
+print(plot_average)
+
+# Plot 2: All Paths + Ensemble Average
+plot_all_paths <- ggplot() +
+  geom_line(data = simulation_results$paths, 
+            aes(x = time, y = value, group = path_id), 
+            alpha = 0.50, color = "#3498DB", size = 0.3) +
+  geom_line(data = ensemble_average, 
+            aes(x = time, y = avg_value), 
+            color = "#E31A1C", size = 1, alpha = 0.9) +
+  geom_hline(yintercept = F_MAX, linetype = "dashed", color = "#2C3E50", size = 0.8) +
+  geom_hline(yintercept = F_MIN, linetype = "dashed", color = "#2C3E50", size = 0.8) +
+  ylim(y_min, y_max) +
+  labs(
+    title = sprintf("VIX Monte Carlo Simulation: %d Paths + Ensemble Average", MC_N_PATHS),
+    subtitle = sprintf("Blue: Individual Paths | Red: Ensemble Average | σ = %.3f", 
+                       actual_volatility),
+    x = "Trading Hours",
+    y = "VIX Level"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "#7F8C8D"),
+    axis.title = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+
+print(plot_all_paths)
+
+# =============================================================================
+# QUANTITATIVE ANALYSIS SUMMARY
+# =============================================================================
+
+cat("\n=== MONTE CARLO SIMULATION RESULTS ===\n")
+cat(sprintf("Simulation Parameters:\n"))
+cat(sprintf("  • Paths Generated: %d\n", MC_N_PATHS))
+cat(sprintf("  • Time Horizon: %g hours\n", TIME_FINAL))
+cat(sprintf("  • Volatility: %.4f (%s)\n", actual_volatility, 
+            ifelse(MC_VOLATILITY == "AUTO", "Auto-Calculated", "Manual")))
+cat(sprintf("  • Random Seed: %d\n", MC_SEED))
+
+cat(sprintf("\nMarket Constraints:\n"))
+cat(sprintf("  • VIX Open: %.2f | VIX Close: %.2f\n", F_START, F_END))
+cat(sprintf("  • Daily Range: [%.2f, %.2f]\n", F_MIN, F_MAX))
+cat(sprintf("  • Range Width: %.2f points\n", F_MAX - F_MIN))
+
+cat(sprintf("\nEnsemble Statistics:\n"))
+cat(sprintf("  • Average Max: %.2f\n", round(max(ensemble_average$avg_value), 2)))
+cat(sprintf("  • Average Min: %.2f\n", round(min(ensemble_average$avg_value), 2)))
+
+cat(sprintf("\nPath Statistics:\n"))
+stats <- simulation_results$statistics
+cat(sprintf("  • Individual Max Range: [%.2f, %.2f]\n", 
+            min(stats$path_max), max(stats$path_max)))
+cat(sprintf("  • Individual Min Range: [%.2f, %.2f]\n", 
+            min(stats$path_min), max(stats$path_min)))
+
+# Constraint validation
+constraints_satisfied <- all(
+  stats$start_value == F_START,
+  stats$end_value == F_END,
+  stats$path_max <= F_MAX + 1e-10,  # Allow for floating point precision
+  stats$path_min >= F_MIN - 1e-10
+)
+cat(sprintf("\nConstraint Validation: %s\n", 
+            ifelse(constraints_satisfied, "✓ ALL SATISFIED", "✗ VIOLATIONS DETECTED")))
+cat("=====================================\n")
